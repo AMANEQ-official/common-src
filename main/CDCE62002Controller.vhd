@@ -10,7 +10,9 @@ use UNISIM.VComponents.all;
 
 entity CDCE62002Controller is
   generic(
-    kSysClkFreq         : integer:= 150_000_000   -- integer [Hz]
+    kSysClkFreq         : integer:= 150_000_000;   -- integer [Hz]
+    kIoStandard         : string:= "LVDS_25";
+    kRefClkInv          : boolean:= false
   );
   port(
     rst	                : in std_logic;
@@ -50,8 +52,8 @@ architecture RTL of CDCE62002Controller is
   signal rst_shiftreg         : std_logic_vector(kWidthRstSr-1 downto 0);
   signal sync_lock            : std_logic;
   signal rst_msb_edge         : std_logic;
-  signal sync_chip_reset      : std_logic;
-  signal edge_chip_reset      : std_logic;
+
+  signal oddr_d1, oddr_d2     : std_logic;
 
   -- internal signal declaration --------------------------------------
   -- start-up --
@@ -99,13 +101,13 @@ begin
   ---------------------------------------------------------------------
   -- CDCE62002 start-up pocess
   ---------------------------------------------------------------------
+  -- Auto reset sequence --
   PDB       <= not (chipReset or rst_shiftreg(kWidthRstSr-1));
 
-  -- Auto reset sequence --
   u_sync : entity mylib.synchronizer
     port map( clkIndep, chipLock, sync_lock );
 
-  u_rst_cnt : process(clkIndep)
+  u_rst_cnt : process(sync_lock, clkIndep)
   begin
     if(clkIndep'event and clkIndep = '1') then
       if(sync_lock = '1') then
@@ -122,7 +124,7 @@ begin
   u_rst_sr : process(clkIndep)
   begin
     if(clkIndep'event and clkIndep = '1') then
-      if(rst_msb_edge = '1' or edge_chip_reset = '1') then
+      if(rst_msb_edge = '1') then
         rst_shiftreg  <= (others => '1');
       else
         rst_shiftreg  <= rst_shiftreg(kWidthRstSr-2 downto 0) & '0';
@@ -130,14 +132,17 @@ begin
     end if;
   end process;
 
-  -- Create long reset signal --
-  u_sync_crst : entity mylib.synchronizer
-    port map( clkIndep, chipReset, sync_chip_reset );
-
-  u_edge_crst : entity mylib.EdgeDetector
-    port map(clkIndep, sync_chip_reset, edge_chip_reset);
-
   -- Main --
+  gen_normal : if kRefClkInv = false generate
+    oddr_d1     <= '1';
+    oddr_d2     <= '0';
+  end generate;
+
+  gen_inv : if kRefClkInv = true generate
+    oddr_d1     <= '0';
+    oddr_d2     <= '1';
+  end generate;
+
   ODDR_inst : ODDR
    generic map(
       DDR_CLK_EDGE => "OPPOSITE_EDGE",
@@ -147,15 +152,15 @@ begin
       Q  => ref_cdce,   -- 1-bit DDR output
       C  => refClkIn,    -- 1-bit clock input
       CE => '1',  -- 1-bit clock enable input
-      D1 => '1',  -- 1-bit data input (positive edge)
-      D2 => '0',  -- 1-bit data input (negative edge)
+      D1 => oddr_d1,  -- 1-bit data input (positive edge)
+      D2 => oddr_d2,  -- 1-bit data input (negative edge)
       R  => '0',    -- 1-bit reset input
       S  => '0'     -- 1-bit set input
       );
 
   OBUFDS_inst : OBUFDS
    generic map (
-      IOSTANDARD => "LVDS_25", -- Specify the output I/O standard
+      IOSTANDARD => kIoStandard, -- Specify the output I/O standard
       SLEW => "FAST")          -- Specify the output slew rate
    port map (
       O  => REF_CLKP,     -- Diff_p output (connect directly to top-level port)
@@ -173,65 +178,63 @@ begin
   MOSI_SPI  <= mosi_if;
   miso_if   <= MISO_SPI;
 
-  u_IfProcess : process(clk)
+  u_IfProcess : process(clk, sync_reset)
     variable count : integer range 0 to kLengthInterval;
   begin
-    if(clk'event and clk = '1') then
-      if(sync_reset = '1') then
-        count             := kLengthInterval;
-        start_spi_if      <= '0';
-        busy_cycle        <= '0';
-        read_phase        <= '0';
-        reg_rxd_lbus      <= (others => '0');
-        state_spi         <= Idle;
-      else
-        case state_spi is
-          when Idle =>
-            start_spi_if      <= '0';
-            read_phase        <= '0';
+    if(sync_reset = '1') then
+      count             := kLengthInterval;
+      start_spi_if      <= '0';
+      busy_cycle        <= '0';
+      read_phase        <= '0';
+      reg_rxd_lbus      <= (others => '0');
+      state_spi         <= Idle;
+    elsif(clk'event and clk = '1') then
+      case state_spi is
+        when Idle =>
+          start_spi_if      <= '0';
+          read_phase        <= '0';
 
-            if(start_a_cycle = '1') then
-              busy_cycle      <= '1';
-              reg_txd_if      <= reg_txd_lbus;
-              start_spi_if    <= '1';
-              state_spi       <= StartIF;
+          if(start_a_cycle = '1') then
+            busy_cycle      <= '1';
+            reg_txd_if      <= reg_txd_lbus;
+            start_spi_if    <= '1';
+            state_spi       <= StartIF;
+          end if;
+
+        when StartIF =>
+          if(busy_if = '1') then
+            start_spi_if  <= '0';
+            state_spi     <= WaitCommandDone;
+          end if;
+
+        when WaitCommandDone =>
+          if(busy_if = '0') then
+            if(mode_read = '1' and read_phase = '0') then
+              count         := kLengthInterval-1;
+              read_phase    <= '1';
+              state_spi     <= Interval;
+            else
+              reg_rxd_lbus  <= rxd_if;
+              state_spi     <= Finalize;
             end if;
+          end if;
 
-          when StartIF =>
-            if(busy_if = '1') then
-              start_spi_if  <= '0';
-              state_spi     <= WaitCommandDone;
-            end if;
+        when Interval =>
+          count   := count - 1;
+          if(count = 0) then
+            start_spi_if  <= '1';
+            state_spi     <= StartIF;
+          end if;
 
-          when WaitCommandDone =>
-            if(busy_if = '0') then
-              if(mode_read = '1' and read_phase = '0') then
-                count         := kLengthInterval-1;
-                read_phase    <= '1';
-                state_spi     <= Interval;
-              else
-                reg_rxd_lbus  <= rxd_if;
-                state_spi     <= Finalize;
-              end if;
-            end if;
+        when Finalize =>
+          busy_cycle  <= '0';
+          read_phase  <= '0';
+          state_spi   <= Idle;
 
-          when Interval =>
-            count   := count - 1;
-            if(count = 0) then
-              start_spi_if  <= '1';
-              state_spi     <= StartIF;
-            end if;
+        when others =>
+          state_spi        <= Idle;
 
-          when Finalize =>
-            busy_cycle  <= '0';
-            read_phase  <= '0';
-            state_spi   <= Idle;
-
-          when others =>
-            state_spi        <= Idle;
-
-        end case;
-      end if;
+      end case;
     end if;
   end process;
 
@@ -271,113 +274,111 @@ begin
   ---------------------------------------------------------------------
   -- Local bus process
   ---------------------------------------------------------------------
-  u_BusProcess : process(clk)
+  u_BusProcess : process(clk, sync_reset)
   begin
-    if(clk'event and clk = '1') then
-      if(sync_reset = '1') then
-        start_a_cycle   <= '0';
-        mode_read       <= '0';
-        reg_txd_lbus    <= (others => '0');
-        state_lbus	    <= Init;
-      else
-        case state_lbus is
-          when Init =>
-            start_a_cycle   <= '0';
-            reg_txd_lbus    <= (others => '0');
-            dataLocalBusOut <= x"00";
-            readyLocalBus		<= '0';
-            state_lbus		  <= Idle;
+    if(sync_reset = '1') then
+      start_a_cycle   <= '0';
+      mode_read       <= '0';
+      reg_txd_lbus    <= (others => '0');
+      state_lbus	    <= Init;
+    elsif(clk'event and clk = '1') then
+      case state_lbus is
+        when Init =>
+          start_a_cycle   <= '0';
+          reg_txd_lbus    <= (others => '0');
+          dataLocalBusOut <= x"00";
+          readyLocalBus		<= '0';
+          state_lbus		  <= Idle;
 
-          when Idle =>
-            readyLocalBus	<= '0';
-            if(weLocalBus = '1' or reLocalBus = '1') then
-              state_lbus	<= Connect;
-            end if;
+        when Idle =>
+          readyLocalBus	<= '0';
+          if(weLocalBus = '1' or reLocalBus = '1') then
+            state_lbus	<= Connect;
+          end if;
 
-          when Connect =>
-            if(weLocalBus = '1') then
-              state_lbus	<= Write;
-            else
-              state_lbus	<= Read;
-            end if;
+        when Connect =>
+          if(weLocalBus = '1') then
+            state_lbus	<= Write;
+          else
+            state_lbus	<= Read;
+          end if;
 
-          when Write =>
-            case addrLocalBus(kNonMultiByte'range) is
-              when kTxd(kNonMultiByte'range) =>
-                if( addrLocalBus(kMultiByte'range) = k1stbyte) then
-                  reg_txd_lbus(7 downto 0)	  <= dataLocalBusIn;
-                elsif( addrLocalBus(kMultiByte'range) = k2ndbyte) then
-                  reg_txd_lbus(15 downto 8)	  <= dataLocalBusIn;
-                elsif( addrLocalBus(kMultiByte'range) = k3rdbyte) then
-                  reg_txd_lbus(23 downto 16)	<= dataLocalBusIn;
-                elsif( addrLocalBus(kMultiByte'range) = k4thbyte) then
-                  reg_txd_lbus(31 downto 24)	<= dataLocalBusIn;
-                else
-                  reg_txd_lbus(31 downto 24)	<= dataLocalBusIn;
-                end if;
-                state_lbus	 <= Done;
+        when Write =>
+          case addrLocalBus(kNonMultiByte'range) is
+            when kTxd(kNonMultiByte'range) =>
+              if( addrLocalBus(kMultiByte'range) = k1stbyte) then
+                reg_txd_lbus(7 downto 0)	  <= dataLocalBusIn;
+              elsif( addrLocalBus(kMultiByte'range) = k2ndbyte) then
+                reg_txd_lbus(15 downto 8)	  <= dataLocalBusIn;
+              elsif( addrLocalBus(kMultiByte'range) = k3rdbyte) then
+                reg_txd_lbus(23 downto 16)	<= dataLocalBusIn;
+              elsif( addrLocalBus(kMultiByte'range) = k4thbyte) then
+                reg_txd_lbus(31 downto 24)	<= dataLocalBusIn;
+              else
+                reg_txd_lbus(31 downto 24)	<= dataLocalBusIn;
+              end if;
+              state_lbus	 <= Done;
 
-              when kExecWrite(kNonMultiByte'range) =>
-                state_lbus	 <= ExecuteWrite;
+            when kExecWrite(kNonMultiByte'range) =>
+              state_lbus	 <= ExecuteWrite;
 
-              when others =>
-                state_lbus	<= Done;
-            end case;
+            when others =>
+              state_lbus	<= Done;
+          end case;
 
-          when Read =>
-            case addrLocalBus(kNonMultiByte'range) is
-              when kRxd(kNonMultiByte'range) =>
-                if( addrLocalBus(kMultiByte'range) = k1stbyte) then
-                  dataLocalBusOut   <= reg_rxd_lbus(7 downto 0);
-                elsif( addrLocalBus(kMultiByte'range) = k2ndbyte) then
-                  dataLocalBusOut   <= reg_rxd_lbus(15 downto 8);
-                elsif( addrLocalBus(kMultiByte'range) = k3rdbyte) then
-                  dataLocalBusOut   <= reg_rxd_lbus(23 downto 16);
-                elsif( addrLocalBus(kMultiByte'range) = k4thbyte) then
-                  dataLocalBusOut   <= reg_rxd_lbus(31 downto 24);
-                else
-                  dataLocalBusOut   <= reg_rxd_lbus(31 downto 24);
-                end if;
-                state_lbus	 <= Done;
+        when Read =>
+          case addrLocalBus(kNonMultiByte'range) is
+            when kRxd(kNonMultiByte'range) =>
+              if( addrLocalBus(kMultiByte'range) = k1stbyte) then
+                dataLocalBusOut   <= reg_rxd_lbus(7 downto 0);
+              elsif( addrLocalBus(kMultiByte'range) = k2ndbyte) then
+                dataLocalBusOut   <= reg_rxd_lbus(15 downto 8);
+              elsif( addrLocalBus(kMultiByte'range) = k3rdbyte) then
+                dataLocalBusOut   <= reg_rxd_lbus(23 downto 16);
+              elsif( addrLocalBus(kMultiByte'range) = k4thbyte) then
+                dataLocalBusOut   <= reg_rxd_lbus(31 downto 24);
+              else
+                dataLocalBusOut   <= reg_rxd_lbus(31 downto 24);
+              end if;
+              state_lbus	 <= Done;
 
-              when kExecRead(kNonMultiByte'range) =>
-                dataLocalBusOut   <= x"00";
-                state_lbus	      <= ExecuteRead;
+            when kExecRead(kNonMultiByte'range) =>
+              dataLocalBusOut   <= x"00";
+              state_lbus	      <= ExecuteRead;
 
-              when others => null;
-            end case;
+            when others => null;
+          end case;
 
-          when ExecuteWrite =>
-            start_a_cycle   <= '1';
-            mode_read       <= '0';
-            state_lbus      <= WaitDone;
+        when ExecuteWrite =>
+          start_a_cycle   <= '1';
+          mode_read       <= '0';
+          state_lbus      <= WaitDone;
 
-          when ExecuteRead =>
-            start_a_cycle   <= '1';
-            mode_read       <= '1';
-            state_lbus      <= WaitDone;
+        when ExecuteRead =>
+          start_a_cycle   <= '1';
+          mode_read       <= '1';
+          state_lbus      <= WaitDone;
 
-          when WaitDone =>
-            start_a_cycle   <= '0';
-            if(reg_busy_cycle = "10") then
-              state_lbus        <= Finalize;
-            end if;
+        when WaitDone =>
+          start_a_cycle   <= '0';
+          if(reg_busy_cycle = "10") then
+            state_lbus        <= Finalize;
+          end if;
 
-          when Finalize =>
-            mode_read       <= '0';
-            state_lbus      <= Done;
+        when Finalize =>
+          mode_read       <= '0';
+          state_lbus      <= Done;
 
-          when Done =>
-            readyLocalBus	<= '1';
-            if(weLocalBus = '0' and reLocalBus = '0') then
-              state_lbus	<= Idle;
-            end if;
+        when Done =>
+          readyLocalBus	<= '1';
+          if(weLocalBus = '0' and reLocalBus = '0') then
+            state_lbus	<= Idle;
+          end if;
 
-          -- probably this is error --
-          when others =>
-            state_lbus	<= Init;
-        end case;
-      end if;
+        -- probably this is error --
+        when others =>
+          state_lbus	<= Init;
+      end case;
     end if;
   end process u_BusProcess;
 
